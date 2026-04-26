@@ -54,25 +54,25 @@ When you hunt for *how* adversaries behave rather than *what* specific indicator
 - **Intelligence-Driven**: Hypothesis-driven hunting using behavioral threat intelligence
 
 ### Advanced Cognitive Capabilities ⭐ NEW
-- **Bias Detection & Mitigation**: Identifies confirmation, anchoring, and availability biases
-- **Competing Hypotheses Generation**: Analysis of Competing Hypotheses (ACH) methodology
-- **Confidence Scoring**: Multi-factor assessment **prioritizing TTP-based detections**
-- **Hunt Stopping Criteria**: Prevents tunnel vision with objective completion metrics
-- **Expert Pattern Recognition**: Built-in behavioral heuristics drawn from veteran-hunter playbooks
+- **Bias Awareness Checks**: Heuristic prompts for confirmation, anchoring, and availability biases (rule-based, not ML — intended as analyst checklists, not automated judgment)
+- **Competing Hypotheses Generator**: Generates benign / insider / external / supply-chain alternatives so ACH (Analysis of Competing Hypotheses) is forced before commitment
+- **Pyramid-of-Pain-weighted Confidence**: TTP-level evidence anchors the score; lower-pyramid indicators (hashes, IPs) only add supplemental context and cannot dilute it
+- **Hunt Stopping Criteria**: Coverage / diminishing-returns / time / confidence thresholds to prevent tunnel vision
+- **Investigation Question Generator**: Standard skeptical prompts ("what would disprove this?", "what's missing?") to ensure thorough analysis
 
 ### Graph-Based Threat Detection ⭐ NEW
-- **Attack Path Analysis**: Identifies critical paths from initial compromise to crown jewels
-- **Living-off-the-Land Detection**: Behavioral detection of LOLBin abuse
-- **Pivot Point Identification**: Betweenness centrality analysis for key attack nodes
-- **Provenance Tracking**: Complete data lineage and ancestry chains
-- **Multi-Stage Attack Correlation**: Reveals patterns invisible in isolation
+- **Attack Path Analysis**: Identifies critical paths from initial compromise to crown jewels (domain controllers, databases, admin accounts)
+- **Living-off-the-Land Detection**: Behavioral detection of LOLBin abuse via parent-child relationships and command-line patterns
+- **Pivot Point Identification**: Brandes betweenness centrality (via NetworkX) over the attack graph; falls back to BFS shortest-path scoring if NetworkX is unavailable
+- **Provenance Tracking**: Data lineage and ancestry chains for forensic context
+- **Lateral-Movement & Credential-Access Edge Tagging**: SMB/RDP/WinRM connections and lsass-targeted process access are tagged at graph-build time so MITRE TTP extraction (T1021, T1003) works on real path traversals
 
 ### Deception Technology Integration ⭐ NEW
-- **Honeytoken Deployment**: Fake AWS keys, passwords, SSH keys, API tokens
-- **Strategic Placement**: Browser history, .env files, config files, memory dumps
-- **Decoy Systems**: Indistinguishable fake servers, workstations, databases
-- **Canary Files**: Executive documents, credentials, source code with embedded beacons
-- **High-Confidence Detection**: 95-99% confidence with <1% false positive rate
+- **Honeytoken Generation**: Fake AWS keys, passwords, SSH keys, API tokens with embedded callback markers
+- **Strategic Placement Helpers**: Suggested locations — browser history, .env files, config files, memory dumps
+- **Decoy System Templates**: Configurable fake servers, workstations, databases
+- **Canary File Generation**: Executive documents, credentials, source code with embedded beacons
+- **Trigger-Based Detection**: Designed for high-signal, low-noise alerting — actual signal-to-noise ratio depends on telemetry wiring in your environment
 
 ### Community Knowledge Base ⭐ NEW
 - **HEARTH Integration**: Access 50+ community-curated threat hunting hypotheses
@@ -84,12 +84,12 @@ When you hunt for *how* adversaries behave rather than *what* specific indicator
 - **Incident-Based Suggestions**: Get relevant hunts based on incident descriptions
 
 ### Traditional Capabilities
-- **Natural Language Processing**: Convert behavioral hunt requests into executable queries
-- **Atlassian Integration**: Confluence and Jira for knowledge management
-- **Splunk Integration**: TTP-focused hunting queries using Splunk SDK
-- **MITRE ATT&CK Framework**: Comprehensive technique and sub-technique mapping
-- **Security Controls**: Authentication, encryption, audit logging, rate limiting
-- **Caching & Performance**: Redis-based caching for optimal performance
+- **Natural Language Processing**: Convert behavioral hunt requests into executable queries (requires `spacy` — gracefully disabled if absent)
+- **Atlassian Integration**: Confluence and Jira for knowledge management (optional)
+- **Splunk Integration**: TTP-focused hunting queries via the Splunk SDK; connection is **lazy** (server boots even if Splunk is unreachable) and the entire integration is gated so the module imports without `splunk-sdk`/`numpy`/`pandas`/`sklearn` installed
+- **MITRE ATT&CK Framework**: Technique and sub-technique mapping with behavioral hunt queries (Sysmon EID 10 for T1003, behavioral cmd.exe/PowerShell discovery for T1083, etc.)
+- **Security Controls**: JWT auth, encryption, audit logging, rate limiting
+- **Caching & Performance**: Redis-based caching (optional)
 
 ## Behavioral Hunting Examples
 
@@ -191,20 +191,19 @@ Try these natural language queries focused on behaviors:
      - Automated handover to security processes
 
 2. **Cognitive Module** ([src/cognitive/hunter_brain.py](src/cognitive/hunter_brain.py)) ⭐ NEW
-   - Expert threat hunter cognitive patterns
-   - Bias detection (confirmation, anchoring, availability)
-   - Competing hypotheses generation (ACH methodology)
-   - Multi-factor confidence scoring
-   - Hunt stopping criteria and decision engine
-   - Investigation question generation
+   - Heuristic checks for confirmation, anchoring, and availability biases (rule-based; not an LLM judge)
+   - Competing hypotheses generator — synthesizes benign / insider / external / supply-chain alternatives for ACH
+   - Pyramid-of-Pain-anchored confidence scoring (high-pyramid evidence dominates; low-pyramid evidence cannot dilute)
+   - Hunt stopping criteria (coverage, diminishing returns, time, confidence)
+   - Investigation question generator
 
 3. **Graph Correlation Engine** ([src/correlation/graph_engine.py](src/correlation/graph_engine.py)) ⭐ NEW
-   - Attack graph construction and analysis
-   - Living-off-the-Land (LOLBin) detection
-   - Attack path identification (initial compromise → crown jewels)
-   - Pivot point detection via betweenness centrality
-   - Provenance tracking and lineage analysis
-   - Process relationship analysis
+   - Attack graph construction with role promotion (hosts → `domain_controller` / `database`, users → `admin_account`) so high-value targets are actually identifiable
+   - Living-off-the-Land (LOLBin) detection via parent-child anomalies, suspicious command lines, and chained execution
+   - Attack path identification with configurable high-value target types
+   - Pivot point detection via Brandes betweenness centrality (NetworkX); BFS shortest-path fallback when NetworkX is missing
+   - Provenance tracking and ancestry analysis
+   - Lateral-movement / credential-access edge tagging based on ports, services, and lsass-targeted ProcessAccess
 
 4. **Deception Manager** ([src/deception/honeytokens.py](src/deception/honeytokens.py)) ⭐ NEW
    - Honeytoken generation and deployment
@@ -214,8 +213,8 @@ Try these natural language queries focused on behaviors:
    - Deception trigger monitoring and response
 
 5. **Integrations**
-   - **Atlassian** ([src/integrations/atlassian.py](src/integrations/atlassian.py)): Confluence/Jira integration
-   - **Splunk** ([src/integrations/splunk.py](src/integrations/splunk.py)): Query execution and ML analysis
+   - **Atlassian** ([src/integrations/atlassian.py](src/integrations/atlassian.py)): Confluence/Jira integration (optional)
+   - **Splunk** ([src/integrations/splunk.py](src/integrations/splunk.py)): Query execution and optional ML analysis (Isolation Forest, DBSCAN, time-series anomaly). Connection is lazy and the entire integration imports cleanly without `splunk-sdk` / `numpy` / `pandas` / `sklearn` — features are gated and self-report unavailability when deps are missing.
 
 6. **Intelligence Engine**
    - **MITRE ATT&CK** ([src/intelligence/threat_intel.py](src/intelligence/threat_intel.py))
@@ -301,9 +300,9 @@ For production deployment features including health monitoring, testing, optimiz
 - 🏥 Health monitoring with `get_server_health()` MCP tool
 - 🛡️ Input validation and security (Pydantic models)
 - ⚡ Token optimization (40-50% reduction)
-- ✅ Automated testing (38 tests, 100% pass rate)
+- ✅ Automated testing (63 tests, 100% pass rate — covers validators, HEARTH integration, server health, splunk query content, graph correlation, and pyramid-of-pain weighting)
 - 📊 Structured JSON logging to stderr
-- 🔄 Graceful degradation for optional features
+- 🔄 Graceful degradation for optional features (Splunk SDK, NumPy/Pandas/scikit-learn, NetworkX, spaCy, Redis are all gated — server boots and degrades cleanly when any are absent)
 
 ## Full Installation
 
@@ -315,13 +314,21 @@ For complete functionality including Splunk, Atlassian, and ML features:
    cd threat-hunting-mcp-server
    ```
 
-2. **Install dependencies**:
+2. **Install base dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Install spaCy model** (if using NLP features):
+3. **Install optional components** as needed (all are gated — the server runs without them and reports unavailability via `get_server_health()`):
    ```bash
+   # Splunk live querying:
+   pip install splunk-sdk
+
+   # Math / M-ATH (Isolation Forest, DBSCAN, time-series anomaly):
+   pip install numpy pandas scikit-learn
+
+   # NLP (natural-language hunt query parsing):
+   pip install spacy
    python -m spacy download en_core_web_lg
    ```
 
@@ -330,6 +337,8 @@ For complete functionality including Splunk, Atlassian, and ML features:
    cp .env.example .env
    # Edit .env with your Splunk/Atlassian credentials
    ```
+
+> **Python version**: tested on 3.11–3.13. The optional ML stack pins are kept out of the default `requirements.txt` so a fresh install on Python 3.13 doesn't fail on transient compatibility issues — uncomment those lines in `requirements.txt` (or install manually as above) when you need them.
 
 ## Configuration
 
