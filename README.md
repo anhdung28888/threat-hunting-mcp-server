@@ -58,7 +58,7 @@ When you hunt for *how* adversaries behave rather than *what* specific indicator
 - **Competing Hypotheses Generation**: Analysis of Competing Hypotheses (ACH) methodology
 - **Confidence Scoring**: Multi-factor assessment **prioritizing TTP-based detections**
 - **Hunt Stopping Criteria**: Prevents tunnel vision with objective completion metrics
-- **Expert Pattern Recognition**: Built-in behavioral heuristics from elite threat hunters (88.3% accuracy)
+- **Expert Pattern Recognition**: Built-in behavioral heuristics drawn from veteran-hunter playbooks
 
 ### Graph-Based Threat Detection ⭐ NEW
 - **Attack Path Analysis**: Identifies critical paths from initial compromise to crown jewels

@@ -2,33 +2,85 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 
-import numpy as np
-import pandas as pd
-import splunklib.client as client
-import splunklib.results as results
-from sklearn.cluster import DBSCAN
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+# Splunk SDK is optional. The hunt-query catalog (`get_hunt_queries_by_technique`)
+# and statistics helpers do not need a live Splunk client, so the module
+# must still import when splunk-sdk isn't installed.
+try:
+    import splunklib.client as client
+    import splunklib.results as splunk_results
+
+    SPLUNK_SDK_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised on minimal installs
+    client = None  # type: ignore[assignment]
+    splunk_results = None  # type: ignore[assignment]
+    SPLUNK_SDK_AVAILABLE = False
+
+# ML/numeric stack is optional — only needed by the M-ATH (math hunt) features.
+# Gate imports so the module loads on Python builds without these deps installed
+# (see requirements.txt — they are commented out for Python 3.13 compat).
+try:
+    import numpy as np
+    import pandas as pd
+    from sklearn.cluster import DBSCAN
+    from sklearn.ensemble import IsolationForest
+    from sklearn.preprocessing import StandardScaler
+
+    ML_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only on minimal installs
+    np = None  # type: ignore[assignment]
+    pd = None  # type: ignore[assignment]
+    DBSCAN = None  # type: ignore[assignment]
+    IsolationForest = None  # type: ignore[assignment]
+    StandardScaler = None  # type: ignore[assignment]
+    ML_AVAILABLE = False
 
 from ..models.hunt import ThreatHunt
 
 logger = logging.getLogger(__name__)
+
+ML_UNAVAILABLE_ERROR = (
+    "ML features (numpy/pandas/sklearn) are not installed. "
+    "Install scientific stack to enable Math/M-ATH hunts."
+)
+SPLUNK_UNAVAILABLE_ERROR = (
+    "splunk-sdk is not installed. "
+    "Install `splunk-sdk` to enable live Splunk queries."
+)
 
 
 class SplunkHuntingEngine:
     """Executes threat hunting queries in Splunk"""
 
     def __init__(self, host: str, port: int, splunk_token: str):
-        self.service = client.connect(
-            host=host,
-            port=port,
-            splunkToken=splunk_token,
-            autologin=True)
+        # Defer the actual Splunk connection until first use so an
+        # unreachable Splunk does not crash MCP server startup.
+        self._connection_args = {
+            "host": host,
+            "port": port,
+            "splunkToken": splunk_token,
+            "autologin": True,
+        }
+        self._service = None
         self.hunt_queries = self._load_hunt_queries()
+
+    @property
+    def service(self):
+        """Lazy Splunk service handle. Connects on first access."""
+        if not SPLUNK_SDK_AVAILABLE:
+            raise RuntimeError(SPLUNK_UNAVAILABLE_ERROR)
+        if self._service is None:
+            try:
+                self._service = client.connect(**self._connection_args)
+            except Exception as exc:
+                logger.error(f"Splunk connection failed: {exc}")
+                raise
+        return self._service
 
     async def execute_hypothesis_hunt(self, hunt: ThreatHunt) -> Dict:
         """Executes queries for hypothesis-driven hunting"""
-        results = {}
+        # NOTE: do not name this `results` — it would shadow the
+        # `splunklib.results` module imported at top of file.
+        query_results: Dict = {}
 
         for query in hunt.queries:
             try:
@@ -40,30 +92,28 @@ class SplunkHuntingEngine:
                 while not job.is_ready():
                     await asyncio.sleep(1)
 
-                result_reader = results.ResultsReader(job.results())
+                result_reader = splunk_results.ResultsReader(job.results())
                 hunt_results = []
 
                 for result in result_reader:
                     if isinstance(result, dict):
                         hunt_results.append(result)
 
-                results[query] = {
+                query_results[query] = {
                     "count": len(hunt_results),
                     "data": hunt_results[:100],
                     "statistics": self._calculate_statistics(hunt_results),
                 }
 
                 logger.info(
-                    f"Query executed: {
-                        len(hunt_results)} results for hunt {
-                        hunt.hunt_id}"
+                    f"Query executed: {len(hunt_results)} results for hunt {hunt.hunt_id}"
                 )
 
             except Exception as e:
                 logger.error(f"Error executing query: {str(e)}")
-                results[query] = {"error": str(e), "count": 0, "data": []}
+                query_results[query] = {"error": str(e), "count": 0, "data": []}
 
-        return results
+        return query_results
 
     async def execute_baseline_hunt(self, metric: str, environment: str) -> Dict:
         """Establishes baselines for normal behavior"""
@@ -83,7 +133,7 @@ class SplunkHuntingEngine:
             while not job.is_ready():
                 await asyncio.sleep(1)
 
-            result_reader = results.ResultsReader(job.results())
+            result_reader = splunk_results.ResultsReader(job.results())
             baseline_data = []
 
             for result in result_reader:
@@ -104,14 +154,22 @@ class SplunkHuntingEngine:
             return {"error": str(e)}
 
     async def execute_math_hunt(self, algorithm: str, data: List[Dict]) -> Dict:
-        """Executes Model-Assisted Threat Hunting"""
+        """Executes Model-Assisted Threat Hunting.
+
+        ML routines are CPU-bound; dispatch them onto a worker thread
+        so we don't block the asyncio event loop.
+        """
+        if not ML_AVAILABLE:
+            logger.warning("execute_math_hunt called but ML stack is unavailable")
+            return {"error": ML_UNAVAILABLE_ERROR, "anomalies": []}
+
         try:
             if algorithm == "isolation_forest":
-                return await self._run_isolation_forest(data)
+                return await asyncio.to_thread(self._run_isolation_forest, data)
             elif algorithm == "clustering":
-                return await self._run_clustering_analysis(data)
+                return await asyncio.to_thread(self._run_clustering_analysis, data)
             elif algorithm == "time_series_anomaly":
-                return await self._run_time_series_analysis(data)
+                return await asyncio.to_thread(self._run_time_series_analysis, data)
             else:
                 raise ValueError(f"Unsupported algorithm: {algorithm}")
 
@@ -133,7 +191,7 @@ class SplunkHuntingEngine:
             while not job.is_ready():
                 await asyncio.sleep(1)
 
-            result_reader = results.ResultsReader(job.results())
+            result_reader = splunk_results.ResultsReader(job.results())
             data = []
 
             for result in result_reader:
@@ -198,14 +256,22 @@ class SplunkHuntingEngine:
                 | where SourceImage!=TargetImage
                 """,
             ],
-            "T1003": [  # Credential Dumping
+            "T1003": [  # OS Credential Dumping (behavior, not IOC strings)
+                # Sysmon EID 10: ProcessAccess targeting lsass.exe with
+                # GrantedAccess flags for memory read (e.g. 0x1010, 0x1410).
+                # Behavior at the TTP layer of the Pyramid of Pain.
                 """
-                index=endpoint (process_name="lsass.exe" AND action="read") OR
-                (cmdline="*sekurlsa*" OR cmdline="*mimikatz*")
+                index=sysmon EventCode=10 TargetImage="*\\\\lsass.exe"
+                | eval ga=lower(GrantedAccess)
+                | where match(ga, "0x1010|0x1410|0x1438|0x143a|0x1fffff")
+                | stats count values(SourceImage) as source_processes
+                    values(SourceUser) as source_users
+                    by Computer
                 """,
+                # Suspicious handle access to lsass — Windows EID 4656.
                 """
-                index=windows EventCode=4656 Object_Name="*\\lsass.exe"
-                | stats count by Account_Name, Computer_Name
+                index=windows EventCode=4656 Object_Name="*\\\\lsass.exe"
+                | stats count by Account_Name, Computer_Name, Process_Name
                 """,
             ],
             "T1021": [  # Remote Services
@@ -221,15 +287,29 @@ class SplunkHuntingEngine:
                 """,
             ],
             "T1083": [  # File and Directory Discovery
-                """
-                index=endpoint (process_name="dir.exe" OR process_name="ls" OR cmdline="*dir *")
-                | stats count by user, process_name, cmdline
-                | where count > 20
-                """,
+                # Windows: dir is a cmd.exe builtin — there is no dir.exe
+                # process. Detect via cmd.exe with `dir` in the command line,
+                # or PowerShell discovery cmdlets. Tree.com / where.exe / fsutil
+                # are real binaries used for the same behavior.
                 """
                 index=sysmon EventCode=1
-                (CommandLine="*dir *" OR CommandLine="*ls *" OR CommandLine="*find *")
-                | stats count by User, CommandLine
+                (
+                    (Image="*\\\\cmd.exe" AND CommandLine="*dir *")
+                    OR Image="*\\\\tree.com"
+                    OR Image="*\\\\where.exe"
+                    OR Image="*\\\\fsutil.exe"
+                    OR (Image="*\\\\powershell*.exe" AND
+                        (CommandLine="*Get-ChildItem*" OR CommandLine="*gci *" OR CommandLine="*ls *"))
+                )
+                | stats count values(CommandLine) as cmds by User, Computer, Image
+                | where count > 20
+                """,
+                # Linux: ls/find/tree as separate processes.
+                """
+                index=linux source=*auditd*
+                (process="ls" OR process="find" OR process="tree" OR process="locate")
+                | stats count values(cmdline) as cmds by user, host, process
+                | where count > 20
                 """,
             ],
         }
@@ -272,19 +352,38 @@ class SplunkHuntingEngine:
                     except (ValueError, TypeError):
                         continue
 
-        if values:
+        if not values:
+            return {"error": "No numeric data for baseline calculation"}
+
+        if ML_AVAILABLE:
             return {
-                "baseline_avg": np.mean(values),
-                "baseline_stdev": np.std(values),
-                "p95_value": np.percentile(values, 95),
-                "min_value": np.min(values),
-                "max_value": np.max(values),
+                "baseline_avg": float(np.mean(values)),
+                "baseline_stdev": float(np.std(values)),
+                "p95_value": float(np.percentile(values, 95)),
+                "min_value": float(np.min(values)),
+                "max_value": float(np.max(values)),
                 "sample_size": len(baseline_data),
             }
 
-        return {"error": "No numeric data for baseline calculation"}
+        # Pure-Python fallback so baselines work without numpy.
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        mean = sum(sorted_vals) / n
+        variance = sum((v - mean) ** 2 for v in sorted_vals) / n
+        # Linear-interpolated p95 to match numpy's default behavior closely.
+        idx = 0.95 * (n - 1)
+        lo, hi = int(idx), min(int(idx) + 1, n - 1)
+        p95 = sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (idx - lo)
+        return {
+            "baseline_avg": mean,
+            "baseline_stdev": variance ** 0.5,
+            "p95_value": p95,
+            "min_value": sorted_vals[0],
+            "max_value": sorted_vals[-1],
+            "sample_size": len(baseline_data),
+        }
 
-    async def _run_isolation_forest(self, data: List[Dict]) -> Dict:
+    def _run_isolation_forest(self, data: List[Dict]) -> Dict:
         """Runs Isolation Forest algorithm for anomaly detection"""
         if not data:
             return {"anomalies": [], "anomaly_score": 0.0}
@@ -331,7 +430,7 @@ class SplunkHuntingEngine:
             "algorithm": "isolation_forest",
         }
 
-    async def _run_clustering_analysis(self, data: List[Dict]) -> Dict:
+    def _run_clustering_analysis(self, data: List[Dict]) -> Dict:
         """Runs clustering analysis for pattern detection"""
         if not data:
             return {"anomalies": [], "anomaly_score": 0.0}
@@ -370,7 +469,7 @@ class SplunkHuntingEngine:
             "algorithm": "dbscan_clustering",
         }
 
-    async def _run_time_series_analysis(self, data: List[Dict]) -> Dict:
+    def _run_time_series_analysis(self, data: List[Dict]) -> Dict:
         """Runs time series anomaly detection"""
         if not data:
             return {"anomalies": [], "anomaly_score": 0.0}

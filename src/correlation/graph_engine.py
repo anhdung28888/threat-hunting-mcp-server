@@ -6,7 +6,29 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 
+try:
+    import networkx as nx
+
+    NETWORKX_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    nx = None  # type: ignore[assignment]
+    NETWORKX_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+# Entity types treated as high-value targets when looking for critical
+# attack paths. Callers can override per-graph.
+DEFAULT_HIGH_VALUE_TYPES = (
+    "domain_controller",
+    "database",
+    "admin_account",
+    "host",  # any host is a fallback target if nothing more specific known
+)
+
+# Heuristic markers used by `_event_to_entity` to upgrade a generic
+# host/user node to a high-value node when the event tells us so.
+DOMAIN_CONTROLLER_HINTS = ("dc", "domain_controller", "domaincontroller")
+ADMIN_ACCOUNT_HINTS = ("admin", "administrator", "domain admins", "enterprise admins")
 
 
 @dataclass
@@ -186,25 +208,37 @@ class GraphCorrelationEngine:
 
         return suspicious_patterns
 
-    async def find_critical_paths(self, graph: AttackGraph,
-                                  pivot_points: List[str]) -> List[AttackPath]:
-        """Identifies critical attack paths through the graph"""
-        critical_paths = []
+    async def find_critical_paths(
+        self,
+        graph: AttackGraph,
+        pivot_points: List[str],
+        high_value_types: Optional[List[str]] = None,
+        confidence_threshold: float = 0.6,
+    ) -> List[AttackPath]:
+        """Identifies critical attack paths through the graph.
 
-        # Find paths from initial compromise to critical assets
+        `high_value_types` defaults to DEFAULT_HIGH_VALUE_TYPES which
+        includes the entity types this engine actually emits. Callers
+        can override per-environment.
+        """
+        critical_paths: List[AttackPath] = []
+        target_types = set(high_value_types or DEFAULT_HIGH_VALUE_TYPES)
+
         for pivot in pivot_points:
             if pivot not in graph.nodes:
                 continue
 
-            # Look for high-value targets
             for node_id, node in graph.nodes.items():
-                if node.entity_type in ["domain_controller", "database", "admin_account"]:
-                    paths = graph.find_paths(pivot, node_id)
+                if node_id == pivot:
+                    continue
+                if node.entity_type not in target_types:
+                    continue
 
-                    for path_ids in paths:
-                        attack_path = self._analyze_attack_path(graph, path_ids)
-                        if attack_path.confidence > 0.6:
-                            critical_paths.append(attack_path)
+                paths = graph.find_paths(pivot, node_id)
+                for path_ids in paths:
+                    attack_path = self._analyze_attack_path(graph, path_ids)
+                    if attack_path.confidence >= confidence_threshold:
+                        critical_paths.append(attack_path)
 
         return critical_paths
 
@@ -239,60 +273,150 @@ class GraphCorrelationEngine:
         return pivot_nodes
 
     def _event_to_entity(self, event: Dict) -> Optional[EntityNode]:
-        """Converts an event to an entity node"""
+        """Converts an event to an entity node.
+
+        Promotes generic host/user nodes to high-value types
+        (domain_controller, admin_account, database) when the event
+        carries explicit role/type hints, so downstream methods like
+        `find_critical_paths` can actually find them.
+        """
+        timestamp = event.get("timestamp", datetime.utcnow())
+
         if "process_name" in event:
             return EntityNode(
                 entity_id=event.get("process_guid", event.get("process_name")),
                 entity_type="process",
                 properties=event,
-                first_seen=event.get("timestamp", datetime.utcnow()),
-                last_seen=event.get("timestamp", datetime.utcnow()),
+                first_seen=timestamp,
+                last_seen=timestamp,
             )
-        elif "user_name" in event:
+
+        if "user_name" in event:
             return EntityNode(
                 entity_id=event.get("user_name"),
-                entity_type="user",
+                entity_type=self._classify_user(event),
                 properties=event,
-                first_seen=event.get("timestamp", datetime.utcnow()),
-                last_seen=event.get("timestamp", datetime.utcnow()),
+                first_seen=timestamp,
+                last_seen=timestamp,
             )
-        elif "host_name" in event:
+
+        if "host_name" in event:
             return EntityNode(
                 entity_id=event.get("host_name"),
-                entity_type="host",
+                entity_type=self._classify_host(event),
                 properties=event,
-                first_seen=event.get("timestamp", datetime.utcnow()),
-                last_seen=event.get("timestamp", datetime.utcnow()),
+                first_seen=timestamp,
+                last_seen=timestamp,
             )
+
+        # Allow callers to express a typed entity directly.
+        if "entity_id" in event and "entity_type" in event:
+            return EntityNode(
+                entity_id=event["entity_id"],
+                entity_type=event["entity_type"],
+                properties=event,
+                first_seen=timestamp,
+                last_seen=timestamp,
+            )
+
         return None
 
-    def _event_to_relationships(self, event: Dict) -> List[RelationshipEdge]:
-        """Extracts relationships from an event"""
-        edges = []
+    @staticmethod
+    def _classify_user(event: Dict) -> str:
+        explicit = (event.get("account_type") or "").lower()
+        if explicit in {"admin", "admin_account"}:
+            return "admin_account"
 
-        # Process creation relationship
+        groups = event.get("groups") or []
+        if isinstance(groups, str):
+            groups = [groups]
+        groups_lower = [str(g).lower() for g in groups]
+        username = str(event.get("user_name", "")).lower()
+        if any(hint in username for hint in ADMIN_ACCOUNT_HINTS):
+            return "admin_account"
+        if any(hint in g for g in groups_lower for hint in ADMIN_ACCOUNT_HINTS):
+            return "admin_account"
+        return "user"
+
+    @staticmethod
+    def _classify_host(event: Dict) -> str:
+        explicit = (event.get("host_role") or event.get("role") or "").lower()
+        if explicit in {"domain_controller", "database"}:
+            return explicit
+        host_name = str(event.get("host_name", "")).lower()
+        if any(hint in host_name for hint in DOMAIN_CONTROLLER_HINTS):
+            return "domain_controller"
+        if "sql" in host_name or "db" in host_name:
+            return "database"
+        return "host"
+
+    def _event_to_relationships(self, event: Dict) -> List[RelationshipEdge]:
+        """Extracts relationships from an event.
+
+        Emits semantic relationship types (lateral_movement,
+        credential_access) when the event signature implies them, so
+        `_extract_ttps_from_path` can map them to MITRE techniques.
+        """
+        edges: List[RelationshipEdge] = []
+        timestamp = event.get("timestamp", datetime.utcnow())
+
+        # Process creation relationship.
         if "parent_process" in event and "process_name" in event:
             edges.append(
                 RelationshipEdge(
                     source_id=event.get("parent_process"),
                     target_id=event.get("process_guid", event.get("process_name")),
                     relationship_type="created",
-                    timestamp=event.get("timestamp", datetime.utcnow()),
+                    timestamp=timestamp,
                     properties=event,
                 )
             )
 
-        # Network connection relationship
+        # Network connection relationship.
         if "source_ip" in event and "dest_ip" in event:
+            relationship_type = "connected_to"
+            # Treat connections to typical lateral-movement ports/services
+            # as `lateral_movement` so TTP extraction can match T1021.
+            dest_port = event.get("dest_port")
+            service = str(event.get("service") or event.get("protocol") or "").lower()
+            try:
+                dest_port_int = int(dest_port) if dest_port is not None else None
+            except (TypeError, ValueError):
+                dest_port_int = None
+            lateral_ports = {22, 135, 139, 445, 3389, 5985, 5986}
+            lateral_services = {"smb", "rdp", "winrm", "ssh", "psexec", "wmi"}
+            if dest_port_int in lateral_ports or service in lateral_services:
+                relationship_type = "lateral_movement"
             edges.append(
                 RelationshipEdge(
                     source_id=event.get("source_ip"),
                     target_id=event.get("dest_ip"),
-                    relationship_type="connected_to",
-                    timestamp=event.get("timestamp", datetime.utcnow()),
+                    relationship_type=relationship_type,
+                    timestamp=timestamp,
                     properties=event,
                 )
             )
+
+        # Credential access — Sysmon EID 10 / 4656 against lsass, etc.
+        target_image = str(event.get("target_image") or event.get("TargetImage") or "").lower()
+        object_name = str(event.get("object_name") or event.get("Object_Name") or "").lower()
+        if "lsass" in target_image or "lsass" in object_name:
+            source = (
+                event.get("source_image")
+                or event.get("SourceImage")
+                or event.get("process_name")
+            )
+            target = event.get("target_image") or event.get("TargetImage") or "lsass.exe"
+            if source and target:
+                edges.append(
+                    RelationshipEdge(
+                        source_id=source,
+                        target_id=target,
+                        relationship_type="credential_access",
+                        timestamp=timestamp,
+                        properties=event,
+                    )
+                )
 
         return edges
 
@@ -411,42 +535,89 @@ class GraphCorrelationEngine:
         )
 
     def _calculate_betweenness_centrality(self, graph: AttackGraph) -> Dict[str, float]:
-        """
-        Calculates betweenness centrality for all nodes
-        Simple implementation - in production use NetworkX
-        """
-        centrality = defaultdict(float)
+        """Calculates betweenness centrality for all nodes.
 
-        # For each pair of nodes, find shortest paths
+        Uses NetworkX's Brandes-algorithm betweenness when available
+        (correct, efficient). Falls back to a normalized shortest-path-
+        frequency approximation when NetworkX is missing — still based
+        on shortest paths via BFS, NOT all-paths DFS like the previous
+        implementation.
+        """
+        if NETWORKX_AVAILABLE:
+            digraph = nx.DiGraph()
+            digraph.add_nodes_from(graph.nodes.keys())
+            for edge in graph.edges:
+                digraph.add_edge(edge.source_id, edge.target_id)
+            return dict(nx.betweenness_centrality(digraph, normalized=True))
+
+        # Fallback: BFS shortest paths only.
+        from collections import deque
+
+        centrality: Dict[str, float] = defaultdict(float)
         node_ids = list(graph.nodes.keys())
-        for i, start in enumerate(node_ids):
-            for end in node_ids[i + 1:]:
-                paths = graph.find_paths(start, end, max_depth=5)
 
-                # Count how many times each node appears in paths
-                for path in paths:
-                    for node_id in path[1:-1]:  # Exclude start and end
-                        centrality[node_id] += 1.0 / len(paths)
+        def bfs_shortest_paths(source: str) -> Dict[str, List[List[str]]]:
+            paths: Dict[str, List[List[str]]] = {source: [[source]]}
+            queue = deque([source])
+            distance = {source: 0}
+            while queue:
+                current = queue.popleft()
+                for neighbor in graph.adjacency.get(current, []):
+                    if neighbor not in distance:
+                        distance[neighbor] = distance[current] + 1
+                        paths[neighbor] = [p + [neighbor] for p in paths[current]]
+                        queue.append(neighbor)
+                    elif distance[neighbor] == distance[current] + 1:
+                        paths[neighbor].extend(p + [neighbor] for p in paths[current])
+            return paths
 
+        for source in node_ids:
+            shortest = bfs_shortest_paths(source)
+            for target, target_paths in shortest.items():
+                if source == target or not target_paths:
+                    continue
+                total = len(target_paths)
+                for path in target_paths:
+                    for node_id in path[1:-1]:
+                        centrality[node_id] += 1.0 / total
+
+        # Normalize so results are comparable to NetworkX's normalized output.
+        n = len(node_ids)
+        if n > 2:
+            scale = 1.0 / ((n - 1) * (n - 2))
+            return {k: v * scale for k, v in centrality.items()}
         return dict(centrality)
 
     def _map_to_kill_chain(self, nodes: List[EntityNode],
                            edges: List[RelationshipEdge]) -> List[str]:
-        """Maps attack path to cyber kill chain stages"""
-        stages = []
+        """Maps attack path to cyber kill chain stages.
 
-        # Analyze node types and relationships to infer stages
+        Inference is driven by both node types and edge relationship
+        types so it works on the entities/relationships this engine
+        actually emits.
+        """
+        stages: List[str] = []
+
         for node in nodes:
-            if node.entity_type == "external_connection":
+            props_str = str(node.properties).lower()
+            if node.entity_type in {"external_connection", "external_ip"}:
                 stages.append("delivery")
-            elif node.entity_type == "process" and "exploit" in str(node.properties):
+            elif node.entity_type == "process" and "exploit" in props_str:
                 stages.append("exploitation")
-            elif node.entity_type == "persistence_mechanism":
+            elif node.entity_type in {"persistence_mechanism", "scheduled_task", "registry_run_key"}:
                 stages.append("installation")
-            elif node.entity_type == "c2_connection":
+            elif node.entity_type in {"c2_connection", "beacon"}:
                 stages.append("command_and_control")
+            elif node.entity_type in {"domain_controller", "database", "admin_account"}:
+                stages.append("actions_on_objectives")
 
-        return list(set(stages))
+        for edge in edges:
+            if edge.relationship_type == "credential_access":
+                stages.append("exploitation")
+            elif edge.relationship_type == "lateral_movement":
+                stages.append("lateral_movement")
+
+        return list(dict.fromkeys(stages))  # de-dup, preserve order
 
     def _extract_ttps_from_path(
             self, nodes: List[EntityNode], edges: List[RelationshipEdge]) -> List[str]:

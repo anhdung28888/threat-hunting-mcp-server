@@ -86,11 +86,15 @@ class ThreatHunterCognition:
             "ttps": 1.0,
         }
 
-    async def generate_competing_hypotheses(
+    def generate_competing_hypotheses(
             self, initial_hypothesis: str, context: Dict) -> List[Hypothesis]:
         """
         Forces consideration of alternative explanations using
-        Analysis of Competing Hypotheses (ACH)
+        Analysis of Competing Hypotheses (ACH).
+
+        This implementation is purely deductive (no I/O), so it is
+        synchronous. Awaiting it is unnecessary; if a future version
+        calls into an LLM it can be reintroduced as async.
         """
         alternatives = []
 
@@ -132,8 +136,12 @@ class ThreatHunterCognition:
 
         return self._rank_hypotheses_by_evidence(alternatives, context)
 
-    async def assess_hunt_confidence(self, evidence: Dict, hypothesis: str) -> Dict[str, float]:
-        """Calculates confidence score accounting for biases"""
+    def assess_hunt_confidence(self, evidence: Dict, hypothesis: str) -> Dict[str, float]:
+        """Calculates confidence score accounting for biases.
+
+        Pure computation, no I/O — kept synchronous to avoid
+        misleading callers about scheduling cost.
+        """
         confidence_factors = {}
 
         # Check for confirmation bias
@@ -231,20 +239,40 @@ class ThreatHunterCognition:
         return sorted(hypotheses, key=lambda h: h.confidence, reverse=True)
 
     def _weight_by_pyramid_level(self, evidence: Dict) -> float:
-        """Weights evidence based on Pyramid of Pain level"""
-        total_weight = 0.0
-        evidence_count = 0
+        """Weights evidence based on the Pyramid of Pain.
 
+        High-pyramid evidence (TTPs, tools) dominates the score. Adding
+        low-pyramid evidence (hashes, IPs) provides supplemental
+        context but cannot dilute or override stronger evidence.
+
+        Score = max(level_weight where evidence exists)
+              + 0.1 * Σ (level_weight * saturated_count_factor) over OTHER levels,
+        clamped to [0, 1]. Each level's supplemental contribution
+        saturates after 5 indicators so the score doesn't drift up
+        from spamming low-quality IOCs.
+        """
+        levels_with_evidence: List[tuple] = []
         for level, weight in self.pyramid_of_pain_weights.items():
-            indicators = evidence.get(level, [])
+            indicators = evidence.get(level, []) or []
             if indicators:
-                total_weight += weight * len(indicators)
-                evidence_count += len(indicators)
+                levels_with_evidence.append((level, weight, len(indicators)))
 
-        if evidence_count == 0:
+        if not levels_with_evidence:
             return 0.0
 
-        return total_weight / evidence_count
+        # Highest pyramid level present anchors the score.
+        max_weight = max(weight for _, weight, _ in levels_with_evidence)
+
+        # Supplemental bonus from other levels — saturates per level so
+        # piling on hashes can't out-vote a single TTP.
+        supplemental = 0.0
+        for _, weight, count in levels_with_evidence:
+            if weight == max_weight:
+                continue
+            saturation = min(count, 5) / 5.0  # 0..1 across 0..5 indicators
+            supplemental += weight * saturation * 0.1
+
+        return min(1.0, max_weight + supplemental)
 
     def _evaluate_absence_of_expected_indicators(self, evidence: Dict) -> float:
         """
