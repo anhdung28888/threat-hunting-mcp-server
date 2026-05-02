@@ -200,8 +200,7 @@ class TaHiTIFramework:
         if hunt.current_phase != TaHiTIPhase.INITIALIZE:
             if hunt.current_phase != TaHiTIPhase.HUNT:
                 raise ValueError(
-                    f"Cannot formulate hypothesis in {
-                        hunt.current_phase} phase"
+                    f"Cannot formulate hypothesis in {hunt.current_phase} phase"
                 )
 
         # Validate hypothesis is testable
@@ -369,8 +368,7 @@ class TaHiTIFramework:
         """Summarize threat intelligence for abstract"""
         if not intel:
             return "No threat intelligence available"
-        return f"{
-            len(intel)} threat intelligence items associated with this hunt"
+        return f"{len(intel)} threat intelligence items associated with this hunt"
 
     def _assess_risk_level(self, hunt: TaHiTIHunt) -> str:
         """Assess risk level based on trigger and intelligence"""

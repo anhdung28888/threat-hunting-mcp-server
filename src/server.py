@@ -1208,11 +1208,8 @@ Based on the scenario analysis, here's a structured hunting approach:
             for i, finding in enumerate(analysis["findings"][:3]):  # Limit to top 3
                 if "query" in finding:
                     detection = {
-                        "name": f"ThreatHunt_{
-                            hunt.hunt_id}_{
-                            i + 1}",
-                        "description": f"Detection based on hunt: {
-                            hunt.hypothesis}",
+                        "name": f"ThreatHunt_{hunt.hunt_id}_{i + 1}",
+                        "description": f"Detection based on hunt: {hunt.hypothesis}",
                         "query": finding["query"],
                         "threshold": max(
                             1,
