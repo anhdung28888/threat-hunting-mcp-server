@@ -28,5 +28,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
     except Exception as e:
-        logger.error("Server initialization failed", error=str(e))
+        logger.exception("Server initialization failed", error=str(e))
         sys.exit(1)

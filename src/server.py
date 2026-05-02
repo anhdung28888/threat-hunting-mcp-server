@@ -139,7 +139,7 @@ class ThreatHuntingMCPServer:
 
     def _validate_config(self):
         """Validate configuration and log feature availability using structured logging"""
-        logger.info("server_startup", event="feature_availability_check")
+        logger.info("server_startup", action="feature_availability_check")
 
         for feature, available in self.features.items():
             logger.info(
